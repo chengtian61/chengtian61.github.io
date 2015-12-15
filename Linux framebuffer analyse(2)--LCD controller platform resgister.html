@@ -1,0 +1,696 @@
+<!DOCTYPE HTML>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <meta name="Keywords" content="blog"/>
+    <meta name="Description" content="blog"/>
+    <title>Simple</title>
+    <link rel="shortcut icon" href="/static/favicon.png"/>
+    <link rel="stylesheet" type="text/css" href="/main.css" />
+</head>
+<body>
+<div class="main">
+    <div class="header">
+    	<ul id="pages">
+            <li><a href="/">home</a></li>
+            <li><a href="/#/tags">tags</a></li>
+            <li><a href="/#/archive">archive</a></li>
+    	</ul>
+    </div>
+	<div class="wrap-header">
+	<h1>
+    <a href="/" id="title"></a>
+	</h1>
+	</div>
+<div id="md" style="display: none;">
+<!-- markdown -->
+###Linux framebuffer analyse(2)--LCD controller platform resgister
+LCD设备驱动在linux内核中是以平台设备platform存在的，在hardkernel的板子中，samsung exynos4412 在kernel 3.0.57的platform driver 在`drivers/video/samsung/s3cfb_main.c`定义
+```
+static int s3cfb_register(void)
+{
+    platform_driver_register(&s3cfb_driver);
+    return 0;
+}
+
+static void s3cfb_unregister(void)
+{
+    platform_driver_unregister(&s3cfb_driver);
+}
+
+module_init(s3cfb_register);
+module_exit(s3cfb_unregister);
+```
+对应的平台驱动为:
+```c
+static struct platform_driver s3cfb_driver = {
+    .probe      = s3cfb_probe,
+    .remove     = s3cfb_remove,
+#ifndef CONFIG_HAS_EARLYSUSPEND
+    .suspend    = s3cfb_suspend,
+    .resume     = s3cfb_resume,
+#endif
+    .driver     = {
+        .name   = S3CFB_NAME,
+        .owner  = THIS_MODULE,
+#ifdef CONFIG_EXYNOS_DEV_PD
+        .pm = &s3cfb_pm_ops,
+#endif
+    },
+};
+
+struct fb_ops s3cfb_ops = {
+    .owner      = THIS_MODULE,
+    .fb_open    = s3cfb_open,
+    .fb_release = s3cfb_release,
+    .fb_check_var   = s3cfb_check_var,
+    .fb_set_par = s3cfb_set_par,
+    .fb_setcolreg   = s3cfb_setcolreg,
+    .fb_blank   = s3cfb_blank,
+    .fb_pan_display = s3cfb_pan_display,
+    .fb_fillrect    = cfb_fillrect,
+    .fb_copyarea    = cfb_copyarea,
+    .fb_imageblit   = cfb_imageblit,
+    .fb_cursor  = s3cfb_cursor,
+    .fb_ioctl   = s3cfb_ioctl,
+};
+```
+so where is the platform device?  对于非device tree的方式，都是在bsp文件中进行添加的，所以可以看`arch/arm/mach-exynos/mach-odroid-x.c`,这边需要在kernel配置的时候配置 `CONFIG_FB_S5P=y`
+```c
+ 991 #ifdef CONFIG_FB_S5P
+ 992     &s3c_device_fb,
+ 993 #endif
+```
+具体的定义在`arch/arm/plat-s5p/dev-fimd-s5p.c`
+```c
+ tatic struct resource s3cfb_resource[] = {
+    [0] = {
+        .start  = S5P_PA_FIMD0,//LCD 的IO内存开始的位置
+        .end    = S5P_PA_FIMD0 + SZ_32K - 1,
+        .flags  = IORESOURCE_MEM,
+    },
+    [1] = {
+        .start  = IRQ_FIMD0_VSYNC,//LCD的开始中断号
+        .end    = IRQ_FIMD0_VSYNC,
+        .flags  = IORESOURCE_IRQ,
+    },
+    [2] = {
+        .start  = IRQ_FIMD0_FIFO,//LCD的开始快速中断号
+        .end    = IRQ_FIMD0_FIFO,
+        .flags  = IORESOURCE_IRQ,
+    },
+};
+
+static u64 fb_dma_mask = 0xffffffffUL;
+
+struct platform_device s3c_device_fb = {
+    .name       = "s3cfb",
+#if defined(CONFIG_ARCH_EXYNOS4)
+    .id     = 0,
+#else
+    .id     = -1,
+#endif
+    .num_resources  = ARRAY_SIZE(s3cfb_resource),
+    .resource   = s3cfb_resource,
+    .dev        = {
+        .dma_mask       = &fb_dma_mask,
+        .coherent_dma_mask  = 0xffffffffUL
+    }
+};
+```
+上面的resource的里面的配置都是从exynos4412的datasheet中可以找到.
+####probe
+在分析probe函数之前需要了解下几个结构体
+samsung在这里用了一个`s3cfb_global`来封装fbdev，这个结构体在s3cfb.h中定义：
+```
+struct s3cfb_global {
+    void __iomem        *regs;
+    struct mutex        lock;
+    struct device       *dev;
+    struct clk      *clock;
+    int         irq;
+    wait_queue_head_t   wq;
+    unsigned int        wq_count;
+    struct fb_info      **fb;  //fb_info的信息
+
+    atomic_t        enabled_win;
+    enum s3cfb_output_t output;
+    enum s3cfb_rgb_mode_t   rgb_mode;
+    struct s3cfb_lcd    *lcd;
+    int         system_state;
+#ifdef CONFIG_HAS_WAKELOCK
+    struct early_suspend    early_suspend;
+    struct wake_lock    idle_lock;
+#endif
+};
+```
+然后我们开始分析probe函数
+```c
+static int s3cfb_probe(struct platform_device *pdev)
+{
+    struct s3c_platform_fb *pdata = NULL;
+    struct resource *res = NULL;
+    struct s3cfb_global *fbdev[2];  //用s3cfb_global代表每一个fbdev
+    int ret = 0;
+    int i = 0;
+
+#ifdef CONFIG_EXYNOS_DEV_PD
+    /* to use the runtime PM helper functions */
+    pm_runtime_enable(&pdev->dev);
+    /* enable the power domain */
+    pm_runtime_get_sync(&pdev->dev);
+#endif
+    fbfimd = kzalloc(sizeof(struct s3cfb_fimd_desc), GFP_KERNEL); //fimd_desc来进一步封装fbdev
+
+    if (FIMD_MAX == 2)//if there are many display,this time we have only one ,so FIMX_MAX == 1
+        fbfimd->dual = 1;
+    else
+        fbfimd->dual = 0;
+
+    for (i = 0; i < FIMD_MAX; i++) {
+        /* global structure */
+        fbfimd->fbdev[i] = kzalloc(sizeof(struct s3cfb_global), GFP_KERNEL); //alloc the memory for every fb device
+        fbdev[i] = fbfimd->fbdev[i];
+        if (!fbdev[i]) {
+            dev_err(fbdev[i]->dev, "failed to allocate for  \
+                global fb structure fimd[%d]!\n", i);
+            goto err0;
+        }
+
+        fbdev[i]->dev = &pdev->dev; //you can reference the platform device 
+/*struct platform_device s3c_device_fb = {
+    .dev        = {
+        .dma_mask       = &fb_dma_mask,
+        .coherent_dma_mask  = 0xffffffffUL
+    }*/
+    //通过调用s3cfb_set_lcd_info为挂在在这个平台设备总线(lcd controller)的设备建立联系
+#if !defined(CONFIG_FB_S5P_MIPI_DSIM)
+        s3cfb_set_lcd_info(fbdev[i]);//you can find this function in /drivers/video/samsung/u133wa01.c as we use this lcd: CONFIG_FB_S5P_U133WA01=y
+        /*void s3cfb_set_lcd_info(struct s3cfb_global *ctrl)
+			{
+			    u133wa01.init_ldi   = NULL;
+			
+			    ctrl->lcd = &u133wa01;
+			    printk("registerd u133wa01 LCD Driver.\n");
+			}*/
+#endif
+        /* platform_data 获取platform的data，这快还不懂，后续分析*/
+        pdata = to_fb_plat(&pdev->dev);
+
+#if defined(CONFIG_FB_S5P_MIPI_DSIM)  //没有定义
+        s5p_dsim_init();
+
+        if (pdata->lcd)  
+            fbdev[i]->lcd = (struct s3cfb_lcd *)pdata->lcd;
+#endif
+        if (pdata->cfg_gpio)
+                   pdata->cfg_gpio(pdev);
+
+        if (pdata->clk_on)
+            pdata->clk_on(pdev, &fbdev[i]->clock);
+
+        /* io memory 获取platform的资源*/
+        res = platform_get_resource(pdev, IORESOURCE_MEM, i);
+        if (!res) {
+            dev_err(fbdev[i]->dev,
+                "failed to get io memory region\n");
+            ret = -EINVAL;
+            goto err1;
+        }
+        res = request_mem_region(res->start,
+                    res->end - res->start + 1, pdev->name);
+        if (!res) {
+            dev_err(fbdev[i]->dev,
+                "failed to request io memory region\n");
+            ret = -EINVAL;
+            goto err1;
+        }
+        fbdev[i]->regs = ioremap(res->start, res->end - res->start + 1);
+        if (!fbdev[i]->regs) {
+            dev_err(fbdev[i]->dev, "failed to remap io region\n");
+            ret = -EINVAL;
+            goto err1;
+        }
+
+        /* irq 获取中断和注册中断*/
+        fbdev[i]->irq = platform_get_irq(pdev, 0);
+        if (request_irq(fbdev[i]->irq, s3cfb_irq_frame, IRQF_SHARED,
+                pdev->name, fbdev[i])) {
+            dev_err(fbdev[i]->dev, "request_irq failed\n");
+            ret = -EINVAL;
+            goto err2;
+        }
+
+#ifdef CONFIG_FB_S5P_TRACE_UNDERRUN
+        if (request_irq(platform_get_irq(pdev, 1), s3cfb_irq_fifo,
+                IRQF_DISABLED, pdev->name, fbdev[i])) {
+            dev_err(fbdev[i]->dev, "request_irq failed\n");
+            ret = -EINVAL;
+            goto err2;
+        }
+
+        s3cfb_set_fifo_interrupt(fbdev[i], 1);
+        dev_info(fbdev[i]->dev, "fifo underrun trace\n");
+        #endif
+        /* hw setting */
+        s3cfb_init_global(fbdev[i]);
+
+        fbdev[i]->system_state = POWER_ON;
+
+        /* alloc fb_info */
+        if (s3cfb_alloc_framebuffer(fbdev[i], i)) {
+            dev_err(fbdev[i]->dev, "alloc error fimd[%d]\n", i);
+            ret = -ENOMEM;
+            goto err3;
+        }
+
+        /* register fb_info */
+        if (s3cfb_register_framebuffer(fbdev[i])) {
+            dev_err(fbdev[i]->dev, "register error fimd[%d]\n", i);
+            return -EINVAL;
+            goto err3;
+        }
+
+        /* enable display */
+        s3cfb_set_clock(fbdev[i]);
+        s3cfb_enable_window(fbdev[0], pdata->default_win);
+
+        s3cfb_update_power_state(fbdev[i], pdata->default_win,
+                    FB_BLANK_UNBLANK);
+        s3cfb_display_on(fbdev[i]);
+
+#ifdef CONFIG_HAS_WAKELOCK
+#ifdef CONFIG_HAS_EARLYSUSPEND
+        fbdev[i]->early_suspend.suspend = s3cfb_early_suspend;
+        fbdev[i]->early_suspend.resume = s3cfb_late_resume;
+        fbdev[i]->early_suspend.level = EARLY_SUSPEND_LEVEL_DISABLE_FB;
+
+        register_early_suspend(&fbdev[i]->early_suspend);
+#endif
+#endif
+    }
+#ifdef CONFIG_FB_S5P_LCD_INIT
+    if (pdata->lcd_on)
+        pdata->lcd_on(pdev);
+
+    /* panel control */
+    if (pdata->backlight_on)
+        pdata->backlight_on(pdev);
+#endif
+    ret = device_create_file(&(pdev->dev), &dev_attr_win_power);
+    if (ret < 0)
+        dev_err(fbdev[0]->dev, "failed to add sysfs entries\n");
+
+    dev_info(fbdev[0]->dev, "registered successfully\n");
+    return 0;
+
+err3:
+    for (i = 0; i < FIMD_MAX; i++)
+        free_irq(fbdev[i]->irq, fbdev[i]);
+err2:
+    for (i = 0; i < FIMD_MAX; i++)
+        iounmap(fbdev[i]->regs);
+err1:
+    for (i = 0; i < FIMD_MAX; i++)
+        pdata->clk_off(pdev, &fbdev[i]->clock);
+err0:
+    return ret;
+}
+```
+<!-- markdown end -->
+</div>
+<div class="entry" id="main">
+<!-- content -->
+<h3 id="linuxframebufferanalyse2lcdcontrollerplatformresgister">Linux framebuffer analyse(2)--LCD controller platform resgister</h3>
+
+<p>LCD设备驱动在linux内核中是以平台设备platform存在的，在hardkernel的板子中，samsung exynos4412 在kernel 3.0.57的platform driver 在<code>drivers/video/samsung/s3cfb_main.c</code>定义</p>
+
+<pre><code>static int s3cfb_register(void)
+{
+    platform_driver_register(&amp;s3cfb_driver);
+    return 0;
+}
+
+static void s3cfb_unregister(void)
+{
+    platform_driver_unregister(&amp;s3cfb_driver);
+}
+
+module_init(s3cfb_register);
+module_exit(s3cfb_unregister);
+</code></pre>
+
+<p>对应的平台驱动为:</p>
+
+<pre><code class="c">static struct platform_driver s3cfb_driver = {
+    .probe      = s3cfb_probe,
+    .remove     = s3cfb_remove,
+#ifndef CONFIG_HAS_EARLYSUSPEND
+    .suspend    = s3cfb_suspend,
+    .resume     = s3cfb_resume,
+#endif
+    .driver     = {
+        .name   = S3CFB_NAME,
+        .owner  = THIS_MODULE,
+#ifdef CONFIG_EXYNOS_DEV_PD
+        .pm = &amp;s3cfb_pm_ops,
+#endif
+    },
+};
+
+struct fb_ops s3cfb_ops = {
+    .owner      = THIS_MODULE,
+    .fb_open    = s3cfb_open,
+    .fb_release = s3cfb_release,
+    .fb_check_var   = s3cfb_check_var,
+    .fb_set_par = s3cfb_set_par,
+    .fb_setcolreg   = s3cfb_setcolreg,
+    .fb_blank   = s3cfb_blank,
+    .fb_pan_display = s3cfb_pan_display,
+    .fb_fillrect    = cfb_fillrect,
+    .fb_copyarea    = cfb_copyarea,
+    .fb_imageblit   = cfb_imageblit,
+    .fb_cursor  = s3cfb_cursor,
+    .fb_ioctl   = s3cfb_ioctl,
+};
+</code></pre>
+
+<p>so where is the platform device?  对于非device tree的方式，都是在bsp文件中进行添加的，所以可以看<code>arch/arm/mach-exynos/mach-odroid-x.c</code>,这边需要在kernel配置的时候配置 <code>CONFIG_FB_S5P=y</code></p>
+
+<pre><code class="c"> 991 #ifdef CONFIG_FB_S5P
+ 992     &amp;s3c_device_fb,
+ 993 #endif
+</code></pre>
+
+<p>具体的定义在<code>arch/arm/plat-s5p/dev-fimd-s5p.c</code></p>
+
+<pre><code class="c"> tatic struct resource s3cfb_resource[] = {
+    [0] = {
+        .start  = S5P_PA_FIMD0,//LCD 的IO内存开始的位置
+        .end    = S5P_PA_FIMD0 + SZ_32K - 1,
+        .flags  = IORESOURCE_MEM,
+    },
+    [1] = {
+        .start  = IRQ_FIMD0_VSYNC,//LCD的开始中断号
+        .end    = IRQ_FIMD0_VSYNC,
+        .flags  = IORESOURCE_IRQ,
+    },
+    [2] = {
+        .start  = IRQ_FIMD0_FIFO,//LCD的开始快速中断号
+        .end    = IRQ_FIMD0_FIFO,
+        .flags  = IORESOURCE_IRQ,
+    },
+};
+
+static u64 fb_dma_mask = 0xffffffffUL;
+
+struct platform_device s3c_device_fb = {
+    .name       = "s3cfb",
+#if defined(CONFIG_ARCH_EXYNOS4)
+    .id     = 0,
+#else
+    .id     = -1,
+#endif
+    .num_resources  = ARRAY_SIZE(s3cfb_resource),
+    .resource   = s3cfb_resource,
+    .dev        = {
+        .dma_mask       = &amp;fb_dma_mask,
+        .coherent_dma_mask  = 0xffffffffUL
+    }
+};
+</code></pre>
+
+<p>上面的resource的里面的配置都是从exynos4412的datasheet中可以找到.</p>
+
+<h4 id="probe">probe</h4>
+
+<p>在分析probe函数之前需要了解下几个结构体
+samsung在这里用了一个<code>s3cfb_global</code>来封装fbdev，这个结构体在s3cfb.h中定义：</p>
+
+<pre><code>struct s3cfb_global {
+    void __iomem        *regs;
+    struct mutex        lock;
+    struct device       *dev;
+    struct clk      *clock;
+    int         irq;
+    wait_queue_head_t   wq;
+    unsigned int        wq_count;
+    struct fb_info      **fb;  //fb_info的信息
+
+    atomic_t        enabled_win;
+    enum s3cfb_output_t output;
+    enum s3cfb_rgb_mode_t   rgb_mode;
+    struct s3cfb_lcd    *lcd;
+    int         system_state;
+#ifdef CONFIG_HAS_WAKELOCK
+    struct early_suspend    early_suspend;
+    struct wake_lock    idle_lock;
+#endif
+};
+</code></pre>
+
+<p>然后我们开始分析probe函数</p>
+
+<pre><code class="c">static int s3cfb_probe(struct platform_device *pdev)
+{
+    struct s3c_platform_fb *pdata = NULL;
+    struct resource *res = NULL;
+    struct s3cfb_global *fbdev[2];  //用s3cfb_global代表每一个fbdev
+    int ret = 0;
+    int i = 0;
+
+#ifdef CONFIG_EXYNOS_DEV_PD
+    /* to use the runtime PM helper functions */
+    pm_runtime_enable(&amp;pdev-&gt;dev);
+    /* enable the power domain */
+    pm_runtime_get_sync(&amp;pdev-&gt;dev);
+#endif
+    fbfimd = kzalloc(sizeof(struct s3cfb_fimd_desc), GFP_KERNEL); //fimd_desc来进一步封装fbdev
+
+    if (FIMD_MAX == 2)//if there are many display,this time we have only one ,so FIMX_MAX == 1
+        fbfimd-&gt;dual = 1;
+    else
+        fbfimd-&gt;dual = 0;
+
+    for (i = 0; i &lt; FIMD_MAX; i++) {
+        /* global structure */
+        fbfimd-&gt;fbdev[i] = kzalloc(sizeof(struct s3cfb_global), GFP_KERNEL); //alloc the memory for every fb device
+        fbdev[i] = fbfimd-&gt;fbdev[i];
+        if (!fbdev[i]) {
+            dev_err(fbdev[i]-&gt;dev, "failed to allocate for  \
+                global fb structure fimd[%d]!\n", i);
+            goto err0;
+        }
+
+        fbdev[i]-&gt;dev = &amp;pdev-&gt;dev; //you can reference the platform device 
+/*struct platform_device s3c_device_fb = {
+    .dev        = {
+        .dma_mask       = &amp;fb_dma_mask,
+        .coherent_dma_mask  = 0xffffffffUL
+    }*/
+    //通过调用s3cfb_set_lcd_info为挂在在这个平台设备总线(lcd controller)的设备建立联系
+#if !defined(CONFIG_FB_S5P_MIPI_DSIM)
+        s3cfb_set_lcd_info(fbdev[i]);//you can find this function in /drivers/video/samsung/u133wa01.c as we use this lcd: CONFIG_FB_S5P_U133WA01=y
+        /*void s3cfb_set_lcd_info(struct s3cfb_global *ctrl)
+            {
+                u133wa01.init_ldi   = NULL;
+
+                ctrl-&gt;lcd = &amp;u133wa01;
+                printk("registerd u133wa01 LCD Driver.\n");
+            }*/
+#endif
+        /* platform_data 获取platform的data，这快还不懂，后续分析*/
+        pdata = to_fb_plat(&amp;pdev-&gt;dev);
+
+#if defined(CONFIG_FB_S5P_MIPI_DSIM)  //没有定义
+        s5p_dsim_init();
+
+        if (pdata-&gt;lcd)  
+            fbdev[i]-&gt;lcd = (struct s3cfb_lcd *)pdata-&gt;lcd;
+#endif
+        if (pdata-&gt;cfg_gpio)
+                   pdata-&gt;cfg_gpio(pdev);
+
+        if (pdata-&gt;clk_on)
+            pdata-&gt;clk_on(pdev, &amp;fbdev[i]-&gt;clock);
+
+        /* io memory 获取platform的资源*/
+        res = platform_get_resource(pdev, IORESOURCE_MEM, i);
+        if (!res) {
+            dev_err(fbdev[i]-&gt;dev,
+                "failed to get io memory region\n");
+            ret = -EINVAL;
+            goto err1;
+        }
+        res = request_mem_region(res-&gt;start,
+                    res-&gt;end - res-&gt;start + 1, pdev-&gt;name);
+        if (!res) {
+            dev_err(fbdev[i]-&gt;dev,
+                "failed to request io memory region\n");
+            ret = -EINVAL;
+            goto err1;
+        }
+        fbdev[i]-&gt;regs = ioremap(res-&gt;start, res-&gt;end - res-&gt;start + 1);
+        if (!fbdev[i]-&gt;regs) {
+            dev_err(fbdev[i]-&gt;dev, "failed to remap io region\n");
+            ret = -EINVAL;
+            goto err1;
+        }
+
+        /* irq 获取中断和注册中断*/
+        fbdev[i]-&gt;irq = platform_get_irq(pdev, 0);
+        if (request_irq(fbdev[i]-&gt;irq, s3cfb_irq_frame, IRQF_SHARED,
+                pdev-&gt;name, fbdev[i])) {
+            dev_err(fbdev[i]-&gt;dev, "request_irq failed\n");
+            ret = -EINVAL;
+            goto err2;
+        }
+
+#ifdef CONFIG_FB_S5P_TRACE_UNDERRUN
+        if (request_irq(platform_get_irq(pdev, 1), s3cfb_irq_fifo,
+                IRQF_DISABLED, pdev-&gt;name, fbdev[i])) {
+            dev_err(fbdev[i]-&gt;dev, "request_irq failed\n");
+            ret = -EINVAL;
+            goto err2;
+        }
+
+        s3cfb_set_fifo_interrupt(fbdev[i], 1);
+        dev_info(fbdev[i]-&gt;dev, "fifo underrun trace\n");
+        #endif
+        /* hw setting */
+        s3cfb_init_global(fbdev[i]);
+
+        fbdev[i]-&gt;system_state = POWER_ON;
+
+        /* alloc fb_info */
+        if (s3cfb_alloc_framebuffer(fbdev[i], i)) {
+            dev_err(fbdev[i]-&gt;dev, "alloc error fimd[%d]\n", i);
+            ret = -ENOMEM;
+            goto err3;
+        }
+
+        /* register fb_info */
+        if (s3cfb_register_framebuffer(fbdev[i])) {
+            dev_err(fbdev[i]-&gt;dev, "register error fimd[%d]\n", i);
+            return -EINVAL;
+            goto err3;
+        }
+
+        /* enable display */
+        s3cfb_set_clock(fbdev[i]);
+        s3cfb_enable_window(fbdev[0], pdata-&gt;default_win);
+
+        s3cfb_update_power_state(fbdev[i], pdata-&gt;default_win,
+                    FB_BLANK_UNBLANK);
+        s3cfb_display_on(fbdev[i]);
+
+#ifdef CONFIG_HAS_WAKELOCK
+#ifdef CONFIG_HAS_EARLYSUSPEND
+        fbdev[i]-&gt;early_suspend.suspend = s3cfb_early_suspend;
+        fbdev[i]-&gt;early_suspend.resume = s3cfb_late_resume;
+        fbdev[i]-&gt;early_suspend.level = EARLY_SUSPEND_LEVEL_DISABLE_FB;
+
+        register_early_suspend(&amp;fbdev[i]-&gt;early_suspend);
+#endif
+#endif
+    }
+#ifdef CONFIG_FB_S5P_LCD_INIT
+    if (pdata-&gt;lcd_on)
+        pdata-&gt;lcd_on(pdev);
+
+    /* panel control */
+    if (pdata-&gt;backlight_on)
+        pdata-&gt;backlight_on(pdev);
+#endif
+    ret = device_create_file(&amp;(pdev-&gt;dev), &amp;dev_attr_win_power);
+    if (ret &lt; 0)
+        dev_err(fbdev[0]-&gt;dev, "failed to add sysfs entries\n");
+
+    dev_info(fbdev[0]-&gt;dev, "registered successfully\n");
+    return 0;
+
+err3:
+    for (i = 0; i &lt; FIMD_MAX; i++)
+        free_irq(fbdev[i]-&gt;irq, fbdev[i]);
+err2:
+    for (i = 0; i &lt; FIMD_MAX; i++)
+        iounmap(fbdev[i]-&gt;regs);
+err1:
+    for (i = 0; i &lt; FIMD_MAX; i++)
+        pdata-&gt;clk_off(pdev, &amp;fbdev[i]-&gt;clock);
+err0:
+    return ret;
+}
+</code></pre>
+<!-- content end -->
+</div>
+<br>
+<br>
+    <div id="disqus_thread"></div>
+	<div class="footer">
+		<p>© Copyright 2014 by isnowfy, Designed by isnowfy</p>
+	</div>
+</div>
+<script src="main.js"></script>
+<script id="content" type="text/mustache">
+    <h1>{{title}}</h1>
+    <div class="tag">
+    {{date}}
+    {{#tags}}
+    <a href="/#/tag/{{name}}">#{{name}}</a>
+    {{/tags}}
+    </div>
+</script>
+<script id="pagesTemplate" type="text/mustache">
+    {{#pages}}
+    <li>
+        <a href="{{path}}">{{title}}</a>
+    </li>
+    {{/pages}}
+</script>
+<script>
+$(document).ready(function() {
+    $.ajax({
+        url: "main.json",
+        type: "GET",
+        dataType: "json",
+        success: function(data) {
+            $("#title").html(data.name);
+            var pagesTemplate = Hogan.compile($("#pagesTemplate").html());
+            var pagesHtml = pagesTemplate.render({"pages": data.pages});
+            $("#pages").append(pagesHtml);
+            //path
+            var path = "Linux framebuffer analyse(2)--LCD controller platform resgister.html";
+            //path end
+            var now = 0;
+            for (var i = 0; i < data.posts.length; ++i)
+                if (path == data.posts[i].path)
+                    now = i;
+            var post = data.posts[now];
+            var tmp = post.tags.split(" ");
+            var tags = [];
+            for (var i = 0; i < tmp.length; ++i)
+                if (tmp[i].length > 0)
+                    tags.push({"name": tmp[i]});
+            var contentTemplate = Hogan.compile($("#content").html());
+            var contentHtml = contentTemplate.render({"title": post.title, "tags": tags, "date": post.date});
+            $("#main").prepend(contentHtml);
+            if (data.disqus_shortname.length > 0) {
+                var disqus_shortname = data.disqus_shortname;
+                (function() {
+                    var dsq = document.createElement('script'); dsq.type = 'text/javascript'; dsq.async = true;
+                    dsq.src = '//' + disqus_shortname + '.disqus.com/embed.js';
+                    (document.getElementsByTagName('head')[0] || document.getElementsByTagName('body')[0]).appendChild(dsq);
+                })();
+            }
+        }
+    });
+});
+</script>
+<script src="http://cdn.mathjax.org/mathjax/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML"></script>
+<script type="text/x-mathjax-config">
+    MathJax.Hub.Config({tex2jax: {inlineMath: [['$','$'], ["\\(", "\\)"]], processEscapes: true}});
+</script>
+</body>
+</html>
