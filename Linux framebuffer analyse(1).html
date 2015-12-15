@@ -1,0 +1,614 @@
+<!DOCTYPE HTML>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <meta name="Keywords" content="blog"/>
+    <meta name="Description" content="blog"/>
+    <title>Simple</title>
+    <link rel="shortcut icon" href="/static/favicon.png"/>
+    <link rel="stylesheet" type="text/css" href="/main.css" />
+</head>
+<body>
+<div class="main">
+    <div class="header">
+    	<ul id="pages">
+            <li><a href="/">home</a></li>
+            <li><a href="/#/tags">tags</a></li>
+            <li><a href="/#/archive">archive</a></li>
+    	</ul>
+    </div>
+	<div class="wrap-header">
+	<h1>
+    <a href="/" id="title"></a>
+	</h1>
+	</div>
+<div id="md" style="display: none;">
+<!-- markdown -->
+###Linux framebuffer analyse(1)--struct analyse
+#### framebuffer
+帧缓冲（framebuffer）是Linux 系统为显示设备提供的一个接口，它将显示缓冲区抽象，屏蔽图像硬件的底层差异，允许上层应用程序在图形模式下直接对显示缓冲区进行读写操作。用户不必关心物理显示缓冲区的具体位置及存放方式，这些都由帧缓冲设备驱动本身来完成。
+framebuffer机制模仿显卡的功能，将显卡硬件结构抽象为一系列的数据结构，可以通过framebuffer的读写直接对显存进行操作。用户可以将framebuffer看成是显存的一个映像，将其映射到进程空间后，就可以直接进行读写操作，写操作会直接反映在屏幕上。
+framebuffer 是个字符设备，主设备号为29，对应于/dev/fb* 设备文件，比如如下显示:
+```shell
+s -l /dev/fb0
+crw-rw---- 1 root video 29, 0 Nov  9 15:11 /dev/fb0
+```
+fb 也是一种普通的内存设备，可以读写其内容。例如，屏幕抓屏：cp /dev/fb0 myfilefb 虽然可以像内存设备（/dev/mem）一样，对其read,write,seek 以及mmap。但区别在于fb 使用的不是整个内存区，而是显存部分。
+####fb的结构以及相关结构体
+fb device driver source codes located in`fb.h(include\linux)`和`fbmem.c(\drivers\video)`,they are middle files in fb device driver, offer the api to the user space and the interface for the low-level driver,you can see the details in the below pictures:
+![imgae](http://my.csdn.net/uploads/201205/23/1337737862_1752.jpg)
+#####fb_info
+a framebuffer has a `struct fb_info` ,it contains lots of attribute and the ops.every fb device has a fb_info:
+```c
+struct fb_info {
+    atomic_t count;
+    int node;
+    int flags;
+    struct mutex lock;      /* Lock for open/release/ioctl funcs */
+    struct mutex mm_lock;       /* Lock for fb_mmap and smem_* fields */
+    struct fb_var_screeninfo var;   /* Current var 当前缓冲区的可变参数*/
+    struct fb_fix_screeninfo fix;   /* Current fix */固定参数*/
+    struct fb_monspecs monspecs;    /* Current Monitor specs */
+    struct work_struct queue;   /* Framebuffer event queue */
+    struct fb_pixmap pixmap;    /* Image hardware mapper */
+    struct fb_pixmap sprite;    /* Cursor hardware mapper */
+    struct fb_cmap cmap;        /* Current cmap 当前的调色板*/
+    struct list_head modelist;      /* mode list */
+    struct fb_videomode *mode;  /* current mode */
+
+#ifdef CONFIG_FB_BACKLIGHT
+    /* assigned backlight device */
+    /* set before framebuffer registration,
+       remove after unregister */
+    struct backlight_device *bl_dev;
+
+    /* Backlight level curve */
+    struct mutex bl_curve_mutex;
+    u8 bl_curve[FB_BACKLIGHT_LEVELS];
+#endif
+#ifdef CONFIG_FB_DEFERRED_IO
+    struct delayed_work deferred_work;
+    struct fb_deferred_io *fbdefio;
+#endif
+
+    struct fb_ops *fbops;//帧缓冲操作函数集
+    struct device *device;      /* This is the parent */
+    struct device *dev;     /* This is this fb device */
+    int class_flag;                    /* private sysfs flags */
+#ifdef CONFIG_FB_TILEBLITTING
+    struct fb_tile_ops *tileops;    /* Tile Blitting */
+#endif
+    char __iomem *screen_base;  /* Virtual address */
+    unsigned long screen_size;  /* Amount of ioremapped VRAM or 0 */
+    void *pseudo_palette;       /* Fake palette of 16 colors */
+#define FBINFO_STATE_RUNNING    0
+#define FBINFO_STATE_SUSPENDED  1
+    u32 state;          /* Hardware state i.e suspend */
+    void *fbcon_par;                /* fbcon use-only private area */
+    /* From here on everything is device dependent */
+    void *par;
+    /* we need the PCI or similar aperture base/size not
+       smem_start/size as smem_start may just be an object
+       allocated inside the aperture so may not actually overlap */
+    struct apertures_struct {
+        unsigned int count;
+        struct aperture {
+            resource_size_t base;
+            resource_size_t size;
+        } ranges[0];
+    } *apertures;
+};    
+```
+#####fb_ops
+>/*
+ \* Frame buffer operations
+ \*
+ \* LOCKING NOTE: those functions must \_ALL\_ be called with the console
+ \* semaphore held, this is the only suitable locking mechanism we have
+ \* in 2.6. Some may be called at interrupt time at this point though.
+ \*
+ \* The exception to this is the debug related hooks.  Putting the fb
+ \* into a debug state (e.g. flipping to the kernel console) and restoring
+ \* it must be done in a lock-free manner, so low level drivers should
+ \* keep track of the initial console (if applicable) and may need to
+ \* perform direct, unlocked hardware writes in these hooks.
+ */
+```c
+struct fb_ops {
+    /* open/release and usage marking */
+    struct module *owner;
+    int (*fb_open)(struct fb_info *info, int user);
+    int (*fb_release)(struct fb_info *info, int user);
+
+    /* For framebuffers with strange non linear layouts or that do not
+     * work with normal memory mapped access
+     */
+    ssize_t (*fb_read)(struct fb_info *info, char __user *buf,
+               size_t count, loff_t *ppos);
+    ssize_t (*fb_write)(struct fb_info *info, const char __user *buf,
+                size_t count, loff_t *ppos);
+
+    /* checks var and eventually tweaks it to something supported,
+     * DO NOT MODIFY PAR */
+    int (*fb_check_var)(struct fb_var_screeninfo *var, struct fb_info *info);
+
+    /* set the video mode according to info->var */
+    int (*fb_set_par)(struct fb_info *info);
+
+    /* set color register */
+    int (*fb_setcolreg)(unsigned regno, unsigned red, unsigned green,
+                unsigned blue, unsigned transp, struct fb_info *info);
+
+    /* set color registers in batch */
+    int (*fb_setcmap)(struct fb_cmap *cmap, struct fb_info *info);
+
+    /* blank display */
+    int (*fb_blank)(int blank, struct fb_info *info);
+
+    /* pan display */
+    int (*fb_pan_display)(struct fb_var_screeninfo *var, struct fb_info *info);
+
+    /* Draws a rectangle */
+    void (*fb_fillrect) (struct fb_info *info, const struct fb_fillrect *rect);
+    /* Copy data from area to another */
+    void (*fb_copyarea) (struct fb_info *info, const struct fb_copyarea *region);
+    /* Draws a image to the display */
+    void (*fb_imageblit) (struct fb_info *info, const struct fb_image *image);
+
+    /* Draws cursor */
+    int (*fb_cursor) (struct fb_info *info, struct fb_cursor *cursor);
+
+    /* Rotates the display */
+    void (*fb_rotate)(struct fb_info *info, int angle);
+     /* wait for blit idle, optional */
+    int (*fb_sync)(struct fb_info *info);
+
+    /* perform fb specific ioctl (optional) */
+    int (*fb_ioctl)(struct fb_info *info, unsigned int cmd,
+            unsigned long arg);
+
+    /* Handle 32bit compat ioctl (optional) */
+    int (*fb_compat_ioctl)(struct fb_info *info, unsigned cmd,
+            unsigned long arg);
+
+    /* perform fb specific mmap */
+    int (*fb_mmap)(struct fb_info *info, struct vm_area_struct *vma);
+
+    /* get capability given var */
+    void (*fb_get_caps)(struct fb_info *info, struct fb_blit_caps *caps,
+                struct fb_var_screeninfo *var);
+
+    /* teardown any resources to do with this framebuffer */
+    void (*fb_destroy)(struct fb_info *info);
+
+    /* called at KDB enter and leave time to prepare the console */
+    int (*fb_debug_enter)(struct fb_info *info);
+    int (*fb_debug_leave)(struct fb_info *info);
+};
+```
+####fb_fix_screeninfo
+fb_fix_screeninfo结构体中，记录了用户不能修改的固定显示控制器参数。这些固定的参数如缓冲区的物理地址、缓冲区的长度等等。
+```c
+struct fb_fix_screeninfo {
+	char id[16];			/* identification string eg "TT Builtin" */
+	unsigned long smem_start;	/* Start of frame buffer mem */
+					/* (physical address) */
+	__u32 smem_len;			/* Length of frame buffer mem */
+	__u32 type;			/* see FB_TYPE_*		*/
+	__u32 type_aux;			/* Interleave for interleaved Planes */
+	__u32 visual;			/* see FB_VISUAL_*		*/ 
+	__u16 xpanstep;			/* zero if no hardware panning  */
+	__u16 ypanstep;			/* zero if no hardware panning  */
+	__u16 ywrapstep;		/* zero if no hardware ywrap    */
+	__u32 line_length;		/* length of a line in bytes    */
+	unsigned long mmio_start;	/* Start of Memory Mapped I/O   */
+					/* (physical address) */
+	__u32 mmio_len;			/* Length of Memory Mapped I/O  */
+	__u32 accel;			/* Indicate to driver which	*/
+					/*  specific chip/card we have	*/
+	__u16 capabilities;		/* see FB_CAP_*			*/
+	__u16 reserved[2];		/* Reserved for future compatibility */
+};
+```
+####fb_var_screeninfo
+fb_var_screeninfo结构体中存储了用户可以修改的显示器控制参数，例如屏幕分辨率、透明度等等。
+```c
+struct fb_var_screeninfo {
+	__u32 xres;			/* visible resolution		*/
+	__u32 yres;
+	__u32 xres_virtual;		/* virtual resolution		*/
+	__u32 yres_virtual;
+	__u32 xoffset;			/* offset from virtual to visible */
+	__u32 yoffset;			/* resolution			*/
+
+	__u32 bits_per_pixel;		/* guess what			*/
+	__u32 grayscale;		/* 0 = color, 1 = grayscale,	*/
+					/* >1 = FOURCC			*/
+	struct fb_bitfield red;		/* bitfield in fb mem if true color, */
+	struct fb_bitfield green;	/* else only length is significant */
+	struct fb_bitfield blue;
+	struct fb_bitfield transp;	/* transparency			*/	
+
+	__u32 nonstd;			/* != 0 Non standard pixel format */
+
+	__u32 activate;			/* see FB_ACTIVATE_*		*/
+
+	__u32 height;			/* height of picture in mm    */
+	__u32 width;			/* width of picture in mm     */
+
+	__u32 accel_flags;		/* (OBSOLETE) see fb_info.flags */
+
+	/* Timing: All values in pixclocks, except pixclock (of course) */
+	__u32 pixclock;			/* pixel clock in ps (pico seconds) */
+	__u32 left_margin;		/* time from sync to picture	*/
+	__u32 right_margin;		/* time from picture to sync	*/
+	__u32 upper_margin;		/* time from sync to picture	*/
+	__u32 lower_margin;
+	__u32 hsync_len;		/* length of horizontal sync	*/
+	__u32 vsync_len;		/* length of vertical sync	*/
+	__u32 sync;			/* see FB_SYNC_*		*/
+	__u32 vmode;			/* see FB_VMODE_*		*/
+	__u32 rotate;			/* angle we rotate counter clockwise */
+	__u32 colorspace;		/* colorspace for FOURCC-based modes */
+	__u32 reserved[4];		/* Reserved for future compatibility */
+};
+```
+####fb_cmap
+fb_cmap结构体中记录了颜色板信息，即调色板信息。，用户空间可以通过ioctl()的FBIOGETCMAP和 FBIOPUTCMAP命令读取或设定颜色表。
+```c
+struct fb_cmap {
+__u32 start;  /* First entry 第一个元素的入口*/
+__u32 len;  /* Number of entries 元素个数*/
+__u16 *red;  /* Red values 红色、绿色、蓝色*/
+__u16 *green;  
+__u16 *blue;
+__u16 *transp;/* transparency, can be NULL 透明度*/
+};
+```
+具体可以看下下面的图：
+![fb_camp](http://my.csdn.net/uploads/201205/23/1337775517_3963.jpg)
+####总结
+上面分析了这么多结构体，那么他们的关系可以用下面的图来表示：
+![struct analyse](http://my.csdn.net/uploads/201205/23/1337775905_8943.jpg)
+<!-- markdown end -->
+</div>
+<div class="entry" id="main">
+<!-- content -->
+<h3 id="linuxframebufferanalyse1structanalyse">Linux framebuffer analyse(1)--struct analyse</h3>
+
+<h4 id="framebuffer">framebuffer</h4>
+
+<p>帧缓冲（framebuffer）是Linux 系统为显示设备提供的一个接口，它将显示缓冲区抽象，屏蔽图像硬件的底层差异，允许上层应用程序在图形模式下直接对显示缓冲区进行读写操作。用户不必关心物理显示缓冲区的具体位置及存放方式，这些都由帧缓冲设备驱动本身来完成。
+framebuffer机制模仿显卡的功能，将显卡硬件结构抽象为一系列的数据结构，可以通过framebuffer的读写直接对显存进行操作。用户可以将framebuffer看成是显存的一个映像，将其映射到进程空间后，就可以直接进行读写操作，写操作会直接反映在屏幕上。
+framebuffer 是个字符设备，主设备号为29，对应于/dev/fb* 设备文件，比如如下显示:</p>
+
+<pre><code class="shell">s -l /dev/fb0
+crw-rw---- 1 root video 29, 0 Nov  9 15:11 /dev/fb0
+</code></pre>
+
+<p>fb 也是一种普通的内存设备，可以读写其内容。例如，屏幕抓屏：cp /dev/fb0 myfilefb 虽然可以像内存设备（/dev/mem）一样，对其read,write,seek 以及mmap。但区别在于fb 使用的不是整个内存区，而是显存部分。</p>
+
+<h4 id="fb">fb的结构以及相关结构体</h4>
+
+<p>fb device driver source codes located in<code>fb.h(include\linux)</code>和<code>fbmem.c(\drivers\video)</code>,they are middle files in fb device driver, offer the api to the user space and the interface for the low-level driver,you can see the details in the below pictures:
+<img src="http://my.csdn.net/uploads/201205/23/1337737862_1752.jpg" alt="imgae" title=""></p>
+
+<h5 id="fb_info">fb_info</h5>
+
+<p>a framebuffer has a <code>struct fb_info</code> ,it contains lots of attribute and the ops.every fb device has a fb_info:</p>
+
+<pre><code class="c">struct fb_info {
+    atomic_t count;
+    int node;
+    int flags;
+    struct mutex lock;      /* Lock for open/release/ioctl funcs */
+    struct mutex mm_lock;       /* Lock for fb_mmap and smem_* fields */
+    struct fb_var_screeninfo var;   /* Current var 当前缓冲区的可变参数*/
+    struct fb_fix_screeninfo fix;   /* Current fix */固定参数*/
+    struct fb_monspecs monspecs;    /* Current Monitor specs */
+    struct work_struct queue;   /* Framebuffer event queue */
+    struct fb_pixmap pixmap;    /* Image hardware mapper */
+    struct fb_pixmap sprite;    /* Cursor hardware mapper */
+    struct fb_cmap cmap;        /* Current cmap 当前的调色板*/
+    struct list_head modelist;      /* mode list */
+    struct fb_videomode *mode;  /* current mode */
+
+#ifdef CONFIG_FB_BACKLIGHT
+    /* assigned backlight device */
+    /* set before framebuffer registration,
+       remove after unregister */
+    struct backlight_device *bl_dev;
+
+    /* Backlight level curve */
+    struct mutex bl_curve_mutex;
+    u8 bl_curve[FB_BACKLIGHT_LEVELS];
+#endif
+#ifdef CONFIG_FB_DEFERRED_IO
+    struct delayed_work deferred_work;
+    struct fb_deferred_io *fbdefio;
+#endif
+
+    struct fb_ops *fbops;//帧缓冲操作函数集
+    struct device *device;      /* This is the parent */
+    struct device *dev;     /* This is this fb device */
+    int class_flag;                    /* private sysfs flags */
+#ifdef CONFIG_FB_TILEBLITTING
+    struct fb_tile_ops *tileops;    /* Tile Blitting */
+#endif
+    char __iomem *screen_base;  /* Virtual address */
+    unsigned long screen_size;  /* Amount of ioremapped VRAM or 0 */
+    void *pseudo_palette;       /* Fake palette of 16 colors */
+#define FBINFO_STATE_RUNNING    0
+#define FBINFO_STATE_SUSPENDED  1
+    u32 state;          /* Hardware state i.e suspend */
+    void *fbcon_par;                /* fbcon use-only private area */
+    /* From here on everything is device dependent */
+    void *par;
+    /* we need the PCI or similar aperture base/size not
+       smem_start/size as smem_start may just be an object
+       allocated inside the aperture so may not actually overlap */
+    struct apertures_struct {
+        unsigned int count;
+        struct aperture {
+            resource_size_t base;
+            resource_size_t size;
+        } ranges[0];
+    } *apertures;
+};    
+</code></pre>
+
+<h5 id="fb_ops">fb_ops</h5>
+
+<blockquote>
+  <p>/*
+   * Frame buffer operations
+   *
+   * LOCKING NOTE: those functions must _ALL_ be called with the console
+   * semaphore held, this is the only suitable locking mechanism we have
+   * in 2.6. Some may be called at interrupt time at this point though.
+   *
+   * The exception to this is the debug related hooks.  Putting the fb
+   * into a debug state (e.g. flipping to the kernel console) and restoring
+   * it must be done in a lock-free manner, so low level drivers should
+   * keep track of the initial console (if applicable) and may need to
+   * perform direct, unlocked hardware writes in these hooks.
+   */</p>
+</blockquote>
+
+<pre><code class="c">struct fb_ops {
+    /* open/release and usage marking */
+    struct module *owner;
+    int (*fb_open)(struct fb_info *info, int user);
+    int (*fb_release)(struct fb_info *info, int user);
+
+    /* For framebuffers with strange non linear layouts or that do not
+     * work with normal memory mapped access
+     */
+    ssize_t (*fb_read)(struct fb_info *info, char __user *buf,
+               size_t count, loff_t *ppos);
+    ssize_t (*fb_write)(struct fb_info *info, const char __user *buf,
+                size_t count, loff_t *ppos);
+
+    /* checks var and eventually tweaks it to something supported,
+     * DO NOT MODIFY PAR */
+    int (*fb_check_var)(struct fb_var_screeninfo *var, struct fb_info *info);
+
+    /* set the video mode according to info-&gt;var */
+    int (*fb_set_par)(struct fb_info *info);
+
+    /* set color register */
+    int (*fb_setcolreg)(unsigned regno, unsigned red, unsigned green,
+                unsigned blue, unsigned transp, struct fb_info *info);
+
+    /* set color registers in batch */
+    int (*fb_setcmap)(struct fb_cmap *cmap, struct fb_info *info);
+
+    /* blank display */
+    int (*fb_blank)(int blank, struct fb_info *info);
+
+    /* pan display */
+    int (*fb_pan_display)(struct fb_var_screeninfo *var, struct fb_info *info);
+
+    /* Draws a rectangle */
+    void (*fb_fillrect) (struct fb_info *info, const struct fb_fillrect *rect);
+    /* Copy data from area to another */
+    void (*fb_copyarea) (struct fb_info *info, const struct fb_copyarea *region);
+    /* Draws a image to the display */
+    void (*fb_imageblit) (struct fb_info *info, const struct fb_image *image);
+
+    /* Draws cursor */
+    int (*fb_cursor) (struct fb_info *info, struct fb_cursor *cursor);
+
+    /* Rotates the display */
+    void (*fb_rotate)(struct fb_info *info, int angle);
+     /* wait for blit idle, optional */
+    int (*fb_sync)(struct fb_info *info);
+
+    /* perform fb specific ioctl (optional) */
+    int (*fb_ioctl)(struct fb_info *info, unsigned int cmd,
+            unsigned long arg);
+
+    /* Handle 32bit compat ioctl (optional) */
+    int (*fb_compat_ioctl)(struct fb_info *info, unsigned cmd,
+            unsigned long arg);
+
+    /* perform fb specific mmap */
+    int (*fb_mmap)(struct fb_info *info, struct vm_area_struct *vma);
+
+    /* get capability given var */
+    void (*fb_get_caps)(struct fb_info *info, struct fb_blit_caps *caps,
+                struct fb_var_screeninfo *var);
+
+    /* teardown any resources to do with this framebuffer */
+    void (*fb_destroy)(struct fb_info *info);
+
+    /* called at KDB enter and leave time to prepare the console */
+    int (*fb_debug_enter)(struct fb_info *info);
+    int (*fb_debug_leave)(struct fb_info *info);
+};
+</code></pre>
+
+<h4 id="fb_fix_screeninfo">fb<em>fix</em>screeninfo</h4>
+
+<p>fb<em>fix</em>screeninfo结构体中，记录了用户不能修改的固定显示控制器参数。这些固定的参数如缓冲区的物理地址、缓冲区的长度等等。</p>
+
+<pre><code class="c">struct fb_fix_screeninfo {
+    char id[16];            /* identification string eg "TT Builtin" */
+    unsigned long smem_start;   /* Start of frame buffer mem */
+                    /* (physical address) */
+    __u32 smem_len;         /* Length of frame buffer mem */
+    __u32 type;         /* see FB_TYPE_*        */
+    __u32 type_aux;         /* Interleave for interleaved Planes */
+    __u32 visual;           /* see FB_VISUAL_*      */ 
+    __u16 xpanstep;         /* zero if no hardware panning  */
+    __u16 ypanstep;         /* zero if no hardware panning  */
+    __u16 ywrapstep;        /* zero if no hardware ywrap    */
+    __u32 line_length;      /* length of a line in bytes    */
+    unsigned long mmio_start;   /* Start of Memory Mapped I/O   */
+                    /* (physical address) */
+    __u32 mmio_len;         /* Length of Memory Mapped I/O  */
+    __u32 accel;            /* Indicate to driver which */
+                    /*  specific chip/card we have  */
+    __u16 capabilities;     /* see FB_CAP_*         */
+    __u16 reserved[2];      /* Reserved for future compatibility */
+};
+</code></pre>
+
+<h4 id="fb_var_screeninfo">fb<em>var</em>screeninfo</h4>
+
+<p>fb<em>var</em>screeninfo结构体中存储了用户可以修改的显示器控制参数，例如屏幕分辨率、透明度等等。</p>
+
+<pre><code class="c">struct fb_var_screeninfo {
+    __u32 xres;         /* visible resolution       */
+    __u32 yres;
+    __u32 xres_virtual;     /* virtual resolution       */
+    __u32 yres_virtual;
+    __u32 xoffset;          /* offset from virtual to visible */
+    __u32 yoffset;          /* resolution           */
+
+    __u32 bits_per_pixel;       /* guess what           */
+    __u32 grayscale;        /* 0 = color, 1 = grayscale,    */
+                    /* &gt;1 = FOURCC          */
+    struct fb_bitfield red;     /* bitfield in fb mem if true color, */
+    struct fb_bitfield green;   /* else only length is significant */
+    struct fb_bitfield blue;
+    struct fb_bitfield transp;  /* transparency         */  
+
+    __u32 nonstd;           /* != 0 Non standard pixel format */
+
+    __u32 activate;         /* see FB_ACTIVATE_*        */
+
+    __u32 height;           /* height of picture in mm    */
+    __u32 width;            /* width of picture in mm     */
+
+    __u32 accel_flags;      /* (OBSOLETE) see fb_info.flags */
+
+    /* Timing: All values in pixclocks, except pixclock (of course) */
+    __u32 pixclock;         /* pixel clock in ps (pico seconds) */
+    __u32 left_margin;      /* time from sync to picture    */
+    __u32 right_margin;     /* time from picture to sync    */
+    __u32 upper_margin;     /* time from sync to picture    */
+    __u32 lower_margin;
+    __u32 hsync_len;        /* length of horizontal sync    */
+    __u32 vsync_len;        /* length of vertical sync  */
+    __u32 sync;         /* see FB_SYNC_*        */
+    __u32 vmode;            /* see FB_VMODE_*       */
+    __u32 rotate;           /* angle we rotate counter clockwise */
+    __u32 colorspace;       /* colorspace for FOURCC-based modes */
+    __u32 reserved[4];      /* Reserved for future compatibility */
+};
+</code></pre>
+
+<h4 id="fb_cmap">fb_cmap</h4>
+
+<p>fb_cmap结构体中记录了颜色板信息，即调色板信息。，用户空间可以通过ioctl()的FBIOGETCMAP和 FBIOPUTCMAP命令读取或设定颜色表。</p>
+
+<pre><code class="c">struct fb_cmap {
+__u32 start;  /* First entry 第一个元素的入口*/
+__u32 len;  /* Number of entries 元素个数*/
+__u16 *red;  /* Red values 红色、绿色、蓝色*/
+__u16 *green;  
+__u16 *blue;
+__u16 *transp;/* transparency, can be NULL 透明度*/
+};
+</code></pre>
+
+<p>具体可以看下下面的图：
+<img src="http://my.csdn.net/uploads/201205/23/1337775517_3963.jpg" alt="fb_camp" title=""></p>
+
+<h4 id="">总结</h4>
+
+<p>上面分析了这么多结构体，那么他们的关系可以用下面的图来表示：
+<img src="http://my.csdn.net/uploads/201205/23/1337775905_8943.jpg" alt="struct analyse" title=""></p>
+<!-- content end -->
+</div>
+<br>
+<br>
+    <div id="disqus_thread"></div>
+	<div class="footer">
+		<p>© Copyright 2014 by isnowfy, Designed by isnowfy</p>
+	</div>
+</div>
+<script src="main.js"></script>
+<script id="content" type="text/mustache">
+    <h1>{{title}}</h1>
+    <div class="tag">
+    {{date}}
+    {{#tags}}
+    <a href="/#/tag/{{name}}">#{{name}}</a>
+    {{/tags}}
+    </div>
+</script>
+<script id="pagesTemplate" type="text/mustache">
+    {{#pages}}
+    <li>
+        <a href="{{path}}">{{title}}</a>
+    </li>
+    {{/pages}}
+</script>
+<script>
+$(document).ready(function() {
+    $.ajax({
+        url: "main.json",
+        type: "GET",
+        dataType: "json",
+        success: function(data) {
+            $("#title").html(data.name);
+            var pagesTemplate = Hogan.compile($("#pagesTemplate").html());
+            var pagesHtml = pagesTemplate.render({"pages": data.pages});
+            $("#pages").append(pagesHtml);
+            //path
+            var path = "Linux framebuffer analyse(1).html";
+            //path end
+            var now = 0;
+            for (var i = 0; i < data.posts.length; ++i)
+                if (path == data.posts[i].path)
+                    now = i;
+            var post = data.posts[now];
+            var tmp = post.tags.split(" ");
+            var tags = [];
+            for (var i = 0; i < tmp.length; ++i)
+                if (tmp[i].length > 0)
+                    tags.push({"name": tmp[i]});
+            var contentTemplate = Hogan.compile($("#content").html());
+            var contentHtml = contentTemplate.render({"title": post.title, "tags": tags, "date": post.date});
+            $("#main").prepend(contentHtml);
+            if (data.disqus_shortname.length > 0) {
+                var disqus_shortname = data.disqus_shortname;
+                (function() {
+                    var dsq = document.createElement('script'); dsq.type = 'text/javascript'; dsq.async = true;
+                    dsq.src = '//' + disqus_shortname + '.disqus.com/embed.js';
+                    (document.getElementsByTagName('head')[0] || document.getElementsByTagName('body')[0]).appendChild(dsq);
+                })();
+            }
+        }
+    });
+});
+</script>
+<script src="http://cdn.mathjax.org/mathjax/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML"></script>
+<script type="text/x-mathjax-config">
+    MathJax.Hub.Config({tex2jax: {inlineMath: [['$','$'], ["\\(", "\\)"]], processEscapes: true}});
+</script>
+</body>
+</html>
