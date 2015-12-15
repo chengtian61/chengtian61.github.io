@@ -187,8 +187,8 @@ struct fb_ops {
     int (*fb_debug_leave)(struct fb_info *info);
 };
 ```
-####fb_fix_screeninfo
-fb_fix_screeninfo结构体中，记录了用户不能修改的固定显示控制器参数。这些固定的参数如缓冲区的物理地址、缓冲区的长度等等。
+####fb\_fix_screeninfo
+`fb_fix_screeninfo`结构体中，记录了用户不能修改的固定显示控制器参数。这些固定的参数如缓冲区的物理地址、缓冲区的长度等等。
 ```c
 struct fb_fix_screeninfo {
 	char id[16];			/* identification string eg "TT Builtin" */
@@ -211,8 +211,8 @@ struct fb_fix_screeninfo {
 	__u16 reserved[2];		/* Reserved for future compatibility */
 };
 ```
-####fb_var_screeninfo
-fb_var_screeninfo结构体中存储了用户可以修改的显示器控制参数，例如屏幕分辨率、透明度等等。
+####fb\_var_screeninfo
+`fb_var_screeninfo`结构体中存储了用户可以修改的显示器控制参数，例如屏幕分辨率、透明度等等。
 ```c
 struct fb_var_screeninfo {
 	__u32 xres;			/* visible resolution		*/
@@ -255,7 +255,7 @@ struct fb_var_screeninfo {
 };
 ```
 ####fb_cmap
-fb_cmap结构体中记录了颜色板信息，即调色板信息。，用户空间可以通过ioctl()的FBIOGETCMAP和 FBIOPUTCMAP命令读取或设定颜色表。
+`fb_cmap`结构体中记录了颜色板信息，即调色板信息。，用户空间可以通过ioctl()的FBIOGETCMAP和 FBIOPUTCMAP命令读取或设定颜色表。
 ```c
 struct fb_cmap {
 __u32 start;  /* First entry 第一个元素的入口*/
@@ -449,9 +449,9 @@ crw-rw---- 1 root video 29, 0 Nov  9 15:11 /dev/fb0
 };
 </code></pre>
 
-<h4 id="fb_fix_screeninfo">fb<em>fix</em>screeninfo</h4>
+<h4 id="fb_fix_screeninfo">fb_fix_screeninfo</h4>
 
-<p>fb<em>fix</em>screeninfo结构体中，记录了用户不能修改的固定显示控制器参数。这些固定的参数如缓冲区的物理地址、缓冲区的长度等等。</p>
+<p><code>fb_fix_screeninfo</code>结构体中，记录了用户不能修改的固定显示控制器参数。这些固定的参数如缓冲区的物理地址、缓冲区的长度等等。</p>
 
 <pre><code class="c">struct fb_fix_screeninfo {
     char id[16];            /* identification string eg "TT Builtin" */
@@ -475,9 +475,9 @@ crw-rw---- 1 root video 29, 0 Nov  9 15:11 /dev/fb0
 };
 </code></pre>
 
-<h4 id="fb_var_screeninfo">fb<em>var</em>screeninfo</h4>
+<h4 id="fb_var_screeninfo">fb_var_screeninfo</h4>
 
-<p>fb<em>var</em>screeninfo结构体中存储了用户可以修改的显示器控制参数，例如屏幕分辨率、透明度等等。</p>
+<p><code>fb_var_screeninfo</code>结构体中存储了用户可以修改的显示器控制参数，例如屏幕分辨率、透明度等等。</p>
 
 <pre><code class="c">struct fb_var_screeninfo {
     __u32 xres;         /* visible resolution       */
@@ -522,7 +522,7 @@ crw-rw---- 1 root video 29, 0 Nov  9 15:11 /dev/fb0
 
 <h4 id="fb_cmap">fb_cmap</h4>
 
-<p>fb_cmap结构体中记录了颜色板信息，即调色板信息。，用户空间可以通过ioctl()的FBIOGETCMAP和 FBIOPUTCMAP命令读取或设定颜色表。</p>
+<p><code>fb_cmap</code>结构体中记录了颜色板信息，即调色板信息。，用户空间可以通过ioctl()的FBIOGETCMAP和 FBIOPUTCMAP命令读取或设定颜色表。</p>
 
 <pre><code class="c">struct fb_cmap {
 __u32 start;  /* First entry 第一个元素的入口*/
